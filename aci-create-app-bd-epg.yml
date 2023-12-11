@@ -1,0 +1,113 @@
+---
+- hosts: all
+  gather_facts: false
+  ignore_unreachable: yes
+  #vars_files:
+  #  - vars.yaml
+  vars:
+  ### Login podaci za ACI (YAML anchor)
+    aci_login: &aci_login
+      hostname: '{{ inventory_hostname }}'
+      username: '{{ username }}'
+      password: '{{ password }}' 
+      validate_certs: False  
+  tasks:
+  ### Pročitaj CSV i registriraj podatke za daljnju obradu
+    - name: Read CSV and register data
+      read_csv:
+        path: vlans-bds.csv
+        fieldnames: vlanid,vlanname
+        delimiter: ','
+      register: vlansbds
+      tags: load-csv
+      delegate_to: localhost
+  ### Dodavanje bridge domene čitajući podatke iz registriranih podataka iz CSV-a
+    - name: Add Bridge Domain
+      cisco.aci.aci_bd:
+        <<: *aci_login
+        tenant: TJ-TENANT
+        bd: "VLAN{{ item.vlanid}}_BD"
+        vrf: TJ-VRF
+        enable_routing: false
+        l2_unknown_unicast: flood
+        arp_flooding: true
+        state: present
+      delegate_to: localhost
+      loop: "{{ vlansbds.list }}"
+      tags: create-bd
+  ### Pročitaj sve konfigurirane bridge domene i registriraj podatke za daljnju obradu
+    - name: Query All Bridge Domains
+      cisco.aci.aci_bd:
+        <<: *aci_login
+        state: query
+        tenant: TJ-TENANT
+      delegate_to: localhost
+      register: query_bd_result
+      tags: query-bd
+  ### Izbriši sve kreirane bridge domene prema listi i query taska
+    - name: Delete All Bridge Domains
+      cisco.aci.aci_bd:
+        <<: *aci_login
+        bd: "{{ item }}"
+        state: absent
+        tenant: TJ-TENANT
+      delegate_to: localhost
+      tags: delete-bd
+      with_items: "{{ query_bd_result | json_query('current[].fvTenant.children[].fvBD.attributes.name')}}"
+  ### Poveži već kreirani L3OUT s bridge domenom      
+    - name: Bind Bridge Domain to L3 Out
+      cisco.aci.aci_bd_to_l3out:
+        <<: *aci_login
+        bd:  "{{ item }}"
+        l3out: TJ-L3OUT
+        tenant: TJ-TENANT
+        state: present
+      delegate_to: localhost
+      with_items: "{{ query_bd_result | json_query('current[].fvTenant.children[].fvBD.attributes.name')}}"
+      tags: bd-l3out
+  ### Kreiraj EPG prema podacima iz CSV-a na početku
+    - name: Create EPG
+      aci_epg:
+        <<: *aci_login
+        tenant: TJ-TENANT
+        bd: "VL{{ item.vlanid }}_BD"
+        ap: TJ-APP
+        epg: "VL{{ item.vlanid }}_EPG"
+        intra_epg_isolation: unenforced
+        description: "{{ item.vlanname }}"
+        state: present
+      delegate_to: localhost
+      loop: "{{ vlansbds.list }}"
+      tags: create-epg
+  ### Dodaj provider contract na EPG (loop kroz već registrirane podatke iz taska 1)
+    - name: Add a new provider contract to EPG binding
+      cisco.aci.aci_epg_to_contract:
+        <<: *aci_login
+        tenant: TJ-TENANT
+        ap: TJ-APP
+        epg: "VL{{ item.vlanid }}_EPG"
+        contract: Permit_Any_CT
+        contract_type: provider
+        state: present
+      delegate_to: localhost
+      tags: bind-epg-provider-ct
+      loop: "{{ vlansbds.list }}"
+  ### Dodaj consumer contract na EPG (loop kroz već registrirane podatke iz taska 1)
+    - name: Add a new consumer contract to EPG binding
+      cisco.aci.aci_epg_to_contract:
+        <<: *aci_login
+        tenant: TJ-TENANT
+        ap: TJ-APP
+        epg: "VL{{ item.vlanid }}_EPG"
+        contract: Permit_Any_CT
+        contract_type: consumer
+        state: present
+      delegate_to: localhost
+      tags: bind-epg-consumer-ct
+      loop: "{{ vlansbds.list }}"
+  ### Za debug
+    - name: Print
+      debug:
+        msg: "{{ item }}"
+      with_items: "{{ query_bd_result | json_query('current[].fvTenant.children[].fvBD.attributes.name')}}"
+      tags: print
